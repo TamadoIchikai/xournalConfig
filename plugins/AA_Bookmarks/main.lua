@@ -22,70 +22,12 @@ function parse_bookmark(txt)
 end
 
 -- Set current layer in a version-tolerant way.
--- Xournal++ 1.3.4 accepts: app.setCurrentLayer(layerNr, change_visibility)
 function set_current_layer_compat(layer)
   if not layer then return false end
-
   local ok = pcall(app.setCurrentLayer, layer, false)
   if ok then return true end
-
-  ok = pcall(app.setCurrentLayer, layer)
-  return ok
+  return pcall(app.setCurrentLayer, layer)
 end
-
--- Xournal++ 1.3.4 only supports app.getTexts("selection") and app.getTexts("layer").
--- Newer builds support app.getTexts("page") and app.getTexts("all").
--- This helper uses the native "all" API when available, otherwise it scans
--- every page/layer and adds the missing page/layer fields manually.
-function get_all_texts_compat()
-  local okAll, allTexts = pcall(app.getTexts, "all")
-  if okAll and type(allTexts) == "table" then
-    return allTexts
-  end
-
-  local structure = app.getDocumentStructure()
-  if not structure or not structure.pages then return {} end
-
-  local oldPage = structure.currentPage
-  local oldLayer = 1
-  if oldPage and structure.pages[oldPage] and structure.pages[oldPage].currentLayer then
-    oldLayer = structure.pages[oldPage].currentLayer
-  end
-
-  local collected = {}
-
-  for page = 1, #structure.pages do
-    app.setCurrentPage(page)
-
-    local pageInfo = structure.pages[page]
-    local numLayers = 1
-    if pageInfo and pageInfo.layers then
-      numLayers = #pageInfo.layers
-      if numLayers < 1 then numLayers = 1 end
-    end
-
-    for layer = 1, numLayers do
-      if set_current_layer_compat(layer) then
-        local okLayer, layerTexts = pcall(app.getTexts, "layer")
-        if okLayer and type(layerTexts) == "table" then
-          for _, t in ipairs(layerTexts) do
-            local item = {}
-            for k, v in pairs(t) do item[k] = v end
-            item.page = page
-            item.layer = layer
-            table.insert(collected, item)
-          end
-        end
-      end
-    end
-  end
-
-  if oldPage then app.setCurrentPage(oldPage) end
-  if oldLayer then set_current_layer_compat(oldLayer) end
-
-  return collected
-end
-
 
 -- Escape a filename/path for POSIX shell commands.
 function shell_quote(path)
@@ -104,8 +46,6 @@ function xml_unescape(str)
       local ok, ch = pcall(utf8.char, code)
       if ok and ch then return ch end
     end
-
-    -- Fallback for plain ASCII if utf8.char is unavailable.
     if code >= 0 and code <= 127 then return string.char(code) end
     return ""
   end
@@ -130,55 +70,37 @@ function xml_attr(attrs, name)
 end
 
 -- Read the saved .xopp file without changing the visible page.
--- .xopp files are gzip-compressed XML, so this uses gzip -cd on Linux.
 function read_xopp_xml_from_disk()
   local structure = app.getDocumentStructure()
   local filename = structure and structure.xoppFilename
 
-  if not filename or filename == "" then
-    return nil, "Document has not been saved yet."
-  end
+  if not filename or filename == "" then return nil end
 
   local cmd = "gzip -cd -- " .. shell_quote(filename) .. " 2>/dev/null"
   local pipe = io.popen(cmd, "r")
-  if not pipe then return nil, "Unable to run gzip." end
+  if not pipe then return nil end
 
   local xml = pipe:read("*a")
   pipe:close()
 
-  if not xml or xml == "" then
-    return nil, "Unable to read saved .xopp file."
-  end
-
-  return xml, nil
+  if not xml or xml == "" then return nil end
+  return xml
 end
 
--- Best-effort normal save before opening the no-reload bookmark manager.
--- The manager reads the saved .xopp XML, so this keeps the on-disk file fresh
--- without scanning all pages/layers through the visible UI.
-function save_document_for_bookmark_manager()
+-- Silent background save triggered only when bookmarks are altered.
+function save_document_silently()
   local structure = app.getDocumentStructure()
   local filename = structure and structure.xoppFilename
 
-  -- If the document has never been saved, Xournal++ needs a real Save As
-  -- interaction first. Do not open the manager with stale/current-layer data.
   if not filename or filename == "" then
     pcall(app.activateAction, "save-as")
     pcall(app.activateAction, "document-save-as")
     pcall(app.uiAction, { action = "ACTION_SAVE_AS" })
-
-    return false, "Document has not been saved yet. Save it as a .xopp file, then open Bookmark Manager again."
+    return false
   end
 
-  -- Try the known action names across Xournal++ versions/builds.
-  -- app.activateAction is the modern API; app.uiAction is kept as a fallback.
   local attempted = false
-
-  local actionNames = {
-    "save",
-    "document-save",
-    "file-save"
-  }
+  local actionNames = {"save", "document-save", "file-save"}
 
   for _, actionName in ipairs(actionNames) do
     local ok = pcall(app.activateAction, actionName)
@@ -187,30 +109,24 @@ function save_document_for_bookmark_manager()
   end
 
   if not attempted then
-    local ok = pcall(app.uiAction, { action = "ACTION_SAVE" })
-    attempted = attempted or ok
+    pcall(app.uiAction, { action = "ACTION_SAVE" })
   end
 
-  if not attempted then
-    return false, "Unable to trigger Xournal++ save action."
-  end
-
-  return true, nil
+  return true
 end
 
--- Fast, no-UI-jump text reader for the bookmark manager.
--- This intentionally does not call app.setCurrentPage() unless the native
--- app.getTexts("all") API exists, so opening the manager will not reload pages.
-function get_all_texts_no_reload()
+-- Fast, unified text reader. Replaces both old text fetchers.
+function get_all_texts()
+  -- Fast path for nightly users
   local okAll, allTexts = pcall(app.getTexts, "all")
   if okAll and type(allTexts) == "table" then
-    return allTexts, "api"
+    return allTexts
   end
 
+  -- Standard path for stable users (Silent XML read)
   local xml = read_xopp_xml_from_disk()
   if not xml then
-    -- Last-resort no-jump fallback: only current layer, because scanning all
-    -- layers/pages would cause the visual reload/jump the user wanted to avoid.
+    -- Fallback to current layer if file is completely unsaved (prevents crashing/flashing)
     local structure = app.getDocumentStructure()
     local currentPage = structure and structure.currentPage or 1
     local currentLayer = 1
@@ -219,7 +135,7 @@ function get_all_texts_no_reload()
     end
 
     local okLayer, layerTexts = pcall(app.getTexts, "layer")
-    if not okLayer or type(layerTexts) ~= "table" then return {}, "current-layer" end
+    if not okLayer or type(layerTexts) ~= "table" then return {} end
 
     local currentTexts = {}
     for _, t in ipairs(layerTexts) do
@@ -229,8 +145,7 @@ function get_all_texts_no_reload()
       item.layer = item.layer or currentLayer
       table.insert(currentTexts, item)
     end
-
-    return currentTexts, "current-layer"
+    return currentTexts
   end
 
   local texts = {}
@@ -261,7 +176,7 @@ function get_all_texts_no_reload()
     end
   end
 
-  return texts, "xopp"
+  return texts
 end
 
 function text_coord_close(a, b)
@@ -269,8 +184,7 @@ function text_coord_close(a, b)
   return math.abs((tonumber(a) or 0) - (tonumber(b) or 0)) < 0.75
 end
 
--- Resolve a bookmark row from the no-reload .xopp list into a live element ref.
--- This is only used when the user intentionally activates/edits/deletes a row.
+-- Resolve a bookmark row from the no-reload list into a live element ref.
 function resolve_bookmark_element(bookmark)
   if not bookmark then return nil end
   if bookmark.ref then return bookmark.ref, bookmark end
@@ -311,7 +225,6 @@ end
 
 -- Centralized Bookmark Styling
 function get_bookmark_style(text, defaultFontName)
-  -- Strip out any existing variants including "Black"
   local baseFontFamily = defaultFontName:gsub(" Regular$", ""):gsub(" Bold$", ""):gsub(" Italic$", ""):gsub(" Black$", "")
   local fontName = baseFontFamily
   local fontSize = 25.0
@@ -368,24 +281,25 @@ function new_bookmark(name)
 
   local newFontName, newFontSize = get_bookmark_style(name, fontName)
 
-  -- Add the text and capture the reference so we can select it
   local refs = app.addTexts({
     texts = {
       { text = name, x = 20, y = 20, color = fontColor, font = { name = newFontName, size = newFontSize } }
     }
   })
 
-  -- Automatically select the newly created bookmark
   if refs and #refs > 0 then
     local currentPage = app.getDocumentStructure().currentPage
     app.clearSelection()
     app.addToSelection(refs)
     app.scrollToPage(currentPage)
   end
+
+  -- Sync UI creation to disk
+  save_document_silently()
 end
 
 function search_bookmark(mode)
-  local allTexts = get_all_texts_compat()
+  local allTexts = get_all_texts()
   if not allTexts then return end
 
   local bookmarkPages = {}
@@ -458,14 +372,12 @@ function delete_bookmark(page, layer, elementRef)
   app.addToSelection({elementRef})
   app.activateAction("delete")
   app.clearSelection()
+  
+  -- Sync UI deletion to disk
+  save_document_silently()
 end
 
 function view_bookmarks()
-  local saved, saveErr = save_document_for_bookmark_manager()
-  if not saved then
-    return app.openDialog("Save required", {"OK"}, saveErr or "Save the document, then open Bookmark Manager again.", true)
-  end
-
   local hasLgi, lgi = pcall(require, "lgi")
   if not hasLgi then
     return app.openDialog("Lua lgi-module is required to view bookmarks.", {"OK"}, "")
@@ -478,8 +390,6 @@ function view_bookmarks()
   local ui, dialog = builder.objects, builder.objects.dlgBookmarks
   dialog:set_title("Xournalpp - Bookmarks Manager")
 
-  -- Keep the ListStore simple and store a Lua-side bookmark index.
-  -- The actual live element ref is resolved lazily only when needed.
   local column = { PAGE = 1, LAYER = 2, PREFIX = 3, DISPLAY_NAME = 4, NAME = 5, IDX = 6 }
   local store = Gtk.ListStore.new {
     [column.PAGE] = lgi.GObject.Type.UINT,
@@ -515,7 +425,7 @@ function view_bookmarks()
     store:clear()
     bookmarks = {}
 
-    local allTexts = get_all_texts_no_reload()
+    local allTexts = get_all_texts()
     local currentPage = app.getDocumentStructure().currentPage
     local closest_exact_idx, closest_below_idx, closest_above_idx
 
@@ -547,7 +457,6 @@ function view_bookmarks()
     for i, b in ipairs(bookmarks) do
       store:append({b.page, b.layer or 1, b.prefix, b.displayName, b.name, i})
 
-      -- Track nearest page index.
       if b.page == currentPage then
         if not closest_exact_idx then closest_exact_idx = i end
       elseif b.page < currentPage then
@@ -601,7 +510,7 @@ function view_bookmarks()
 
     local ref, liveEl = resolve_bookmark_element(b)
     if not ref then
-      return app.openDialog("Bookmark not found in current document.", {"OK"}, "Save/reopen the document or refresh the bookmark list.", true)
+      return app.openDialog("Bookmark not found in current document.", {"OK"}, "Refresh the bookmark list.", true)
     end
 
     app.clearSelection()
@@ -638,12 +547,14 @@ function view_bookmarks()
       b.ref = refs and refs[1] or nil
 
       update_row_from_bookmark(model, iter, b)
+      
+      -- Sync UI modification to disk
+      save_document_silently()
     else
       app.clearSelection()
     end
   end
 
-  -- Restored Declarative Syntax to prevent 0-indexing layout bug
   local treeView = Gtk.TreeView {
     model = store,
     Gtk.TreeViewColumn { 
@@ -664,7 +575,6 @@ function view_bookmarks()
     }
   }
 
-  -- Manual Drag-to-Scroll implementation with Inertia Physics for Stylus users
   local drag_active = false
   local drag_start_y = 0
   local scroll_start_val = 0
@@ -688,7 +598,7 @@ function view_bookmarks()
       velocity = 0
       stop_inertia()
     end
-    return false -- allow event to propagate to rows for selection/editing
+    return false 
   end
 
   function treeView:on_button_release_event(event)
@@ -713,7 +623,7 @@ function view_bookmarks()
           end
 
           vadj:set_value(new_val)
-          velocity = velocity * 0.90 -- Friction/Decay multiplier
+          velocity = velocity * 0.90 
 
           if math.abs(velocity) < 0.5 then
             scroll_tick = nil
@@ -735,7 +645,6 @@ function view_bookmarks()
       local vadj = ui.scrolledWindow:get_vadjustment()
       vadj:set_value(scroll_start_val + dy)
 
-      -- If we moved a noticeable amount, consume the event so we don't accidentally drag-select multiple rows
       if math.abs(dy) > 5 then return true end
     end
     return false
@@ -776,7 +685,7 @@ function view_bookmarks()
 
     local ref = resolve_bookmark_element(b)
     if not ref then
-      return app.openDialog("Bookmark not found in current document.", {"OK"}, "Save/reopen the document or refresh the bookmark list.", true)
+      return app.openDialog("Bookmark not found in current document.", {"OK"}, "Refresh the bookmark list.", true)
     end
 
     app.clearSelection()
@@ -784,8 +693,10 @@ function view_bookmarks()
     app.activateAction("delete")
     app.clearSelection()
 
-    -- Remove from the visible manager immediately without re-scanning all pages.
     pcall(function() store:remove(iter) end)
+    
+    -- Sync UI deletion to disk
+    save_document_silently()
   end
 
   function dialog:on_destroy() stop_inertia() end
@@ -796,7 +707,6 @@ function view_bookmarks()
   dialog:show_all()
   if mx and my then dialog:move(mx - dialog:get_allocated_width() / 2, my - dialog:get_allocated_height() / 2) end
 
-  -- Select and scroll to nearest bookmark upon opening the dialog
   if initial_best_idx then
     local path = lgi.Gtk.TreePath.new_from_string(tostring(initial_best_idx - 1))
     treeView:get_selection():select_path(path)
@@ -821,7 +731,7 @@ function export()
   os.execute("pdftk \"" .. tempPdf .. "\" dump_data output \"" .. tempData .. "\"")
 
   local bookmarks = {}
-  local allTexts = get_all_texts_compat()
+  local allTexts = get_all_texts()
   
   for _, t in ipairs(allTexts) do
     if parse_bookmark(t.text or "") and t.page then
