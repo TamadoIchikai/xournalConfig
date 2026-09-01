@@ -2,13 +2,19 @@ utf8_to_html = require("utf8_to_html")
 
 DEFAULT_EXPORT_PATH = "/tmp/temp"
 
--- Helper function to get mouse position
+-- Helper function to get mouse position. Uses only non-deprecated APIs; the
+-- legacy get_pointer() path is avoided because it is a known source of native
+-- crashes via LGI on the Windows Gdk backend. Any failure yields (nil, nil).
 function get_mouse_position()
-  local hasLgi, lgi = pcall(require, "lgi")
-  if not hasLgi then return nil, nil end
-  local pointer = lgi.Gdk.Display.get_default():get_default_seat():get_pointer()
-  if not pointer then return nil, nil end
-  local _, x, y = pointer:get_position()
+  local ok, x, y = pcall(function()
+    local lgi = require("LuaGObject")
+    local display = lgi.Gdk.Display.get_default()
+    local seat = display:get_default_seat()
+    local pointer = seat:get_pointer()
+    local _, px, py = pointer:get_position()
+    return px, py
+  end)
+  if not ok then return nil, nil end
   return x, y
 end
 
@@ -27,11 +33,6 @@ function set_current_layer_compat(layer)
   local ok = pcall(app.setCurrentLayer, layer, false)
   if ok then return true end
   return pcall(app.setCurrentLayer, layer)
-end
-
--- Escape a filename/path for POSIX shell commands.
-function shell_quote(path)
-  return "'" .. tostring(path):gsub("'", "'\\''") .. "'"
 end
 
 -- Decode the XML entities used inside .xopp text elements.
@@ -70,25 +71,62 @@ function xml_attr(attrs, name)
 end
 
 -- Read the saved .xopp file without changing the visible page.
+-- Uses a pure-Lua gzip/Deflate decompressor (inflate.lua) so it works on any
+-- platform, including Windows where the `gzip` binary is not available. The
+-- .xopp format is gzip-compressed XML; we decompress it in memory and return
+-- the XML text for all pages.
 function read_xopp_xml_from_disk()
+  local inflate = require("inflate")
   local structure = app.getDocumentStructure()
   local filename = structure and structure.xoppFilename
-
   if not filename or filename == "" then return nil end
 
-  local cmd = "gzip -cd -- " .. shell_quote(filename) .. " 2>/dev/null"
-  local pipe = io.popen(cmd, "r")
-  if not pipe then return nil end
+  local ok, bytes = pcall(function()
+    local fh = io.open(filename, "rb")
+    if not fh then return nil end
+    local data = fh:read("*a")
+    fh:close()
+    return data
+  end)
+  if not ok or not bytes then return nil end
 
-  local xml = pipe:read("*a")
-  pipe:close()
+  return inflate.gunzip(bytes)
+end
 
-  if not xml or xml == "" then return nil end
-  return xml
+-- Cache of get_all_texts() results. Keyed by page/layer structure so repeated
+-- calls (e.g. Next/Previous Bookmark navigation) stay instant; cleared on any
+-- plugin bookmark mutation (create/edit/delete). A short TTL bounds staleness
+-- if text is changed directly in the document (outside the plugin).
+local allTextsCache = nil
+local CACHE_TTL = 3.0
+
+-- Compact signature of the document structure: page count + layer count per
+-- page. Any change here invalidates cached text lists.
+local function structure_cache_sig(structure)
+  local parts = { tostring(#(structure.pages or {})) }
+  for p = 1, #(structure.pages or {}) do
+    local pi = structure.pages[p]
+    parts[#parts + 1] = ":" .. tostring(pi and #(pi.layers or {}) or 0)
+  end
+  return table.concat(parts)
+end
+
+-- Copy a text element returned by the native getTexts() API, tagging it with
+-- the page/layer it came from (unless the element already carries them).
+local function annotate_text(t, page, layer)
+  local item = {}
+  for k, v in pairs(t) do item[k] = v end
+  item.page = item.page or page
+  item.layer = item.layer or layer
+  return item
 end
 
 -- Silent background save triggered only when bookmarks are altered.
 function save_document_silently()
+  -- Any save from this plugin invalidates the cached text list; bookmarks may
+  -- have been added/edited/removed.
+  allTextsCache = nil
+
   local structure = app.getDocumentStructure()
   local filename = structure and structure.xoppFilename
 
@@ -117,66 +155,121 @@ end
 
 -- Fast, unified text reader. Replaces both old text fetchers.
 function get_all_texts()
-  -- Fast path for nightly users
+  local structure = app.getDocumentStructure()
+  if not structure or not structure.pages or #structure.pages == 0 then
+    return {}
+  end
+
+  local sig = structure_cache_sig(structure)
+  if allTextsCache and allTextsCache.sig == sig
+     and os.clock() - (allTextsCache.t or 0) < CACHE_TTL then
+    return allTextsCache.texts
+  end
+
+  local texts, complete
   local okAll, allTexts = pcall(app.getTexts, "all")
-  if okAll and type(allTexts) == "table" then
-    return allTexts
+  if okAll and type(allTexts) == "table" and #allTexts > 0 then
+    texts, complete = allTexts, true
+  else
+    texts, complete = read_all_texts_native(structure)
+    if not complete then
+      texts, complete = read_all_texts_fallback(structure, texts)
+    end
   end
 
-  -- Standard path for stable users (Silent XML read)
-  local xml = read_xopp_xml_from_disk()
-  if not xml then
-    -- Fallback to current layer if file is completely unsaved (prevents crashing/flashing)
-    local structure = app.getDocumentStructure()
-    local currentPage = structure and structure.currentPage or 1
-    local currentLayer = 1
-    if structure and structure.pages and structure.pages[currentPage] then
-      currentLayer = structure.pages[currentPage].currentLayer or 1
-    end
-
-    local okLayer, layerTexts = pcall(app.getTexts, "layer")
-    if not okLayer or type(layerTexts) ~= "table" then return {} end
-
-    local currentTexts = {}
-    for _, t in ipairs(layerTexts) do
-      local item = {}
-      for k, v in pairs(t) do item[k] = v end
-      item.page = item.page or currentPage
-      item.layer = item.layer or currentLayer
-      table.insert(currentTexts, item)
-    end
-    return currentTexts
+  if complete then
+    allTextsCache = { sig = sig, texts = texts, t = os.clock() }
   end
+  return texts
+end
 
+-- Read every page (and every real layer) through the native getTexts("layer")
+-- API. This is far faster on large files than decompressing the .xopp and
+-- always reflects the live in-memory document. setCurrentPage/setCurrentLayer
+-- do not scroll the view or change layer visibility; the original page + layer
+-- are restored. Returns (texts, complete).
+function read_all_texts_native(structure)
   local texts = {}
-  local pageNr = 0
+  local origPage = structure.currentPage or 1
 
-  for pageAttrs, pageBody in xml:gmatch("<page([^>]*)>(.-)</page>") do
-    pageNr = pageNr + 1
-    local layerNr = 0
-
-    for layerAttrs, layerBody in pageBody:gmatch("<layer([^>]*)>(.-)</layer>") do
-      layerNr = layerNr + 1
-
-      for textAttrs, encodedText in layerBody:gmatch("<text%s+([^>]*)>(.-)</text>") do
-        table.insert(texts, {
-          text = xml_unescape(encodedText),
-          page = pageNr,
-          layer = layerNr,
-          x = tonumber(xml_attr(textAttrs, "x")) or 0,
-          y = tonumber(xml_attr(textAttrs, "y")) or 0,
-          color = xml_attr(textAttrs, "color"),
-          font = {
-            name = xml_attr(textAttrs, "font") or "Sans Regular",
-            size = tonumber(xml_attr(textAttrs, "size")) or 12.0
-          },
-          ref = nil
-        })
+  local ok = pcall(function()
+    for p = 1, #structure.pages do
+      app.setCurrentPage(p)
+      local pageInfo = structure.pages[p]
+      -- layers is 0-indexed: [0]=background, [1..N]=real layers. The `#`
+      -- operator counts the 1-based trailing entries, i.e. the real layers.
+      local nLayers = math.max(1, #(pageInfo.layers or {}))
+      for l = 1, nLayers do
+        pcall(app.setCurrentLayer, l, false)
+        local okL, layerTexts = pcall(app.getTexts, "layer")
+        if okL and type(layerTexts) == "table" then
+          for _, t in ipairs(layerTexts) do
+            table.insert(texts, annotate_text(t, p, l))
+          end
+        end
       end
     end
+  end)
+
+  -- Restore the original page and layer in all cases.
+  pcall(app.setCurrentPage, origPage)
+  local origInfo = structure.pages[origPage]
+  if origInfo then
+    pcall(app.setCurrentLayer, origInfo.currentLayer or 1, false)
   end
 
-  return texts
+  return texts, ok and #texts > 0
+end
+
+-- Read all text elements from the on-disk .xopp file (works everywhere), and
+-- if that is not possible, fall back to the current page's active layer.
+function read_all_texts_fallback(structure, texts)
+  local xml = read_xopp_xml_from_disk()
+  if xml then
+    local result = {}
+    local pageNr = 0
+
+    for pageAttrs, pageBody in xml:gmatch("<page([^>]*)>(.-)</page>") do
+      pageNr = pageNr + 1
+      local layerNr = 0
+
+      for layerAttrs, layerBody in pageBody:gmatch("<layer([^>]*)>(.-)</layer>") do
+        layerNr = layerNr + 1
+
+        for textAttrs, encodedText in layerBody:gmatch("<text%s+([^>]*)>(.-)</text>") do
+          table.insert(result, {
+            text = xml_unescape(encodedText),
+            page = pageNr,
+            layer = layerNr,
+            x = tonumber(xml_attr(textAttrs, "x")) or 0,
+            y = tonumber(xml_attr(textAttrs, "y")) or 0,
+            color = xml_attr(textAttrs, "color"),
+            font = {
+              name = xml_attr(textAttrs, "font") or "Sans Regular",
+              size = tonumber(xml_attr(textAttrs, "size")) or 12.0
+            },
+            ref = nil
+          })
+        end
+      end
+    end
+
+    -- A non-nil xml means the on-disk file was read and decompressed, so its
+    -- result is authoritative for the whole document even if it has no texts.
+    return result, true
+  end
+
+  -- Unsaved document with no file on disk: read just the current page's
+  -- active layer via the native API. This is the only incomplete case, so it
+  -- is not cached.
+  local currentPage = structure.currentPage or 1
+  local okLayer, layerTexts = pcall(app.getTexts, "layer")
+  if okLayer and type(layerTexts) == "table" then
+    for _, t in ipairs(layerTexts) do
+      table.insert(texts, annotate_text(t, currentPage))
+    end
+  end
+  return texts, false
 end
 
 function text_coord_close(a, b)
@@ -292,10 +385,16 @@ function new_bookmark(name)
     app.clearSelection()
     app.addToSelection(refs)
     app.scrollToPage(currentPage)
+    app.refreshPage()
   end
 
-  -- Sync UI creation to disk
-  save_document_silently()
+  -- Invalidate the cached text list so later reads see the new bookmark. We do
+  -- NOT trigger an immediate disk save here: it reloads/resets the document and
+  -- would deselect the text we just selected. The change stays in-memory (and
+  -- in xournalpp's undo stack); it hits disk on the user's next normal save.
+  allTextsCache = nil
+
+  return refs, name
 end
 
 function search_bookmark(mode)
@@ -329,7 +428,7 @@ function search_bookmark(mode)
 end
 
 function dialog_new_bookmark()
-  local hasLgi, lgi = pcall(require, "lgi")
+  local hasLgi, lgi = pcall(require, "LuaGObject")
   if not hasLgi then return new_bookmark() end
 
   local Gtk = lgi.require("Gtk", "3.0")
@@ -341,6 +440,8 @@ function dialog_new_bookmark()
   dialog:set_title("Xournalpp - New bookmark")
   ui.btnNewOk:set_sensitive(false)
 
+  local new_refs, new_name = nil, nil
+
   function ui.entryName:on_changed()
     ui.btnNewOk:set_sensitive(parse_bookmark(self:get_text()) ~= nil)
   end
@@ -348,7 +449,7 @@ function dialog_new_bookmark()
   local function ok()
     local name = ui.entryName:get_text()
     if parse_bookmark(name) then
-      new_bookmark(name)
+      new_refs, new_name = new_bookmark(name)
       dialog:destroy()
     end
   end
@@ -360,8 +461,10 @@ function dialog_new_bookmark()
   local mouse_x, mouse_y = get_mouse_position()
   dialog:show_all()
   if mouse_x and mouse_y then
-    dialog:move(mouse_x - dialog:get_allocated_width() / 2, mouse_y - dialog:get_allocated_height() / 2)
+    dialog:move(math.floor(mouse_x - dialog:get_allocated_width() / 2), math.floor(mouse_y - dialog:get_allocated_height() / 2))
   end
+
+  return new_refs, new_name
 end
 
 function delete_bookmark(page, layer, elementRef)
@@ -372,23 +475,49 @@ function delete_bookmark(page, layer, elementRef)
   app.addToSelection({elementRef})
   app.activateAction("delete")
   app.clearSelection()
-  
+  app.refreshPage()
+
   -- Sync UI deletion to disk
   save_document_silently()
 end
 
 function view_bookmarks()
-  local hasLgi, lgi = pcall(require, "lgi")
+  local hasLgi, lgi = pcall(require, "LuaGObject")
   if not hasLgi then
     return app.openDialog("Lua lgi-module is required to view bookmarks.", {"OK"}, "")
   end
 
+  -- Run the real implementation inside pcall so an unexpected Lua error does
+  -- not leave the GTK main loop in a corrupt state.
+  local ok, err = pcall(view_bookmarks_impl, lgi)
+  if not ok then
+    app.openDialog("An error occurred while opening the bookmark manager.\n\n" .. tostring(err), {"OK"}, "", true)
+  end
+end
+
+function view_bookmarks_impl(lgi)
   local Gtk = lgi.require("Gtk", "3.0")
   local builder = Gtk.Builder()
   assert(builder:add_from_file(sourcePath .. "dlgBookmarks.glade"))
 
   local ui, dialog = builder.objects, builder.objects.dlgBookmarks
   dialog:set_title("Xournalpp - Bookmarks Manager")
+
+  -- Paint the window background black before the dialog is shown, so the
+  -- default (light) window color does not flash white during initialization.
+  -- path:
+  --   1. realize() so the GdkWindow exists;
+  --   2. set the GDK-level background RGBA on that window (affects the very
+  --      first surface paint, before any GTK draw pass);
+  --   3. override_background_color keeps it black once GTK draws the frame.
+  pcall(function()
+    dialog:realize()
+    local rgba = lgi.Gdk.RGBA()
+    rgba.red, rgba.green, rgba.blue, rgba.alpha = 0, 0, 0, 1
+    local gwin = dialog:get_window()
+    if gwin then gwin:set_background_rgba(rgba) end
+    dialog:override_background_color(lgi.Gtk.StateFlags.NORMAL, rgba)
+  end)
 
   local column = { PAGE = 1, LAYER = 2, PREFIX = 3, DISPLAY_NAME = 4, NAME = 5, IDX = 6 }
   local store = Gtk.ListStore.new {
@@ -484,8 +613,11 @@ function view_bookmarks()
 
   local initial_best_idx = updateTable()
 
-  local nameRenderer = Gtk.CellRendererText { editable = true }
-  function nameRenderer:on_edited(path_str, new_text)
+  local active_edit = nil
+
+  -- Apply a rename/edit of a bookmark's text to the live document. Shared by
+  -- the cell renderer (Enter), focus-out (clicking away / pressing Done).
+  local function apply_edit(path_str, new_text)
     local success, iter = store:get_iter(Gtk.TreePath.new_from_string(path_str))
     iter = type(success) == "userdata" and success or iter
     if not iter then return end
@@ -546,12 +678,52 @@ function view_bookmarks()
       b.font = { name = newFontName, size = newFontSize }
       b.ref = refs and refs[1] or nil
 
+      app.refreshPage()
       update_row_from_bookmark(model, iter, b)
-      
+
       -- Sync UI modification to disk
       save_document_silently()
     else
       app.clearSelection()
+    end
+  end
+
+  -- Commit the in-progress cell edit, unless it was already applied (e.g. the
+  -- edit was Enter-committed and the teardown focus-out fires afterwards) or
+  -- the user explicitly cancelled with Escape.
+  local function commit_active_edit()
+    local session = active_edit
+    if session and not session.committed and not session.canceled then
+      session.committed = true
+      apply_edit(session.path, session.entry:get_text())
+    end
+  end
+
+  local nameRenderer = Gtk.CellRendererText { editable = true }
+  function nameRenderer:on_edited(path_str, new_text)
+    if active_edit and active_edit.committed then
+      active_edit = nil
+      return
+    end
+    active_edit = nil
+    apply_edit(path_str, new_text)
+  end
+
+  function nameRenderer:on_editing_started(editable, path)
+    active_edit = { entry = editable, path = path, committed = false, canceled = false }
+
+    -- Escape cancels the edit like Gtk does; make sure the focus-out that
+    -- follows does not commit the discarded text.
+    function editable:on_key_press_event(event)
+      if event.keyval == lgi.Gdk.KEY_Escape then active_edit.canceled = true end
+      return false
+    end
+
+    -- Clicking away (or onto Done) ends editing without emitting `edited` in
+    -- GTK3, so commit the text explicitly here.
+    function editable:on_focus_out_event()
+      commit_active_edit()
+      return false
     end
   end
 
@@ -581,6 +753,7 @@ function view_bookmarks()
   local last_y = 0
   local velocity = 0
   local scroll_tick = nil
+  local dialog_destroyed = false
 
   local function stop_inertia()
     if scroll_tick then
@@ -590,6 +763,7 @@ function view_bookmarks()
   end
 
   function treeView:on_button_press_event(event)
+    if dialog_destroyed then return false end
     if event.button == 1 then
       drag_active = true
       drag_start_y = event.y_root
@@ -602,11 +776,14 @@ function view_bookmarks()
   end
 
   function treeView:on_button_release_event(event)
+    if dialog_destroyed then return false end
     if event.button == 1 then 
       drag_active = false 
       if math.abs(velocity) > 1.5 then
         scroll_tick = lgi.GLib.timeout_add(lgi.GLib.PRIORITY_DEFAULT, 16, function()
-          if drag_active then return false end
+          -- Guard against use-after-free: the dialog may have been destroyed
+          -- while this timeout was pending.
+          if dialog_destroyed or drag_active then return false end
 
           local vadj = ui.scrolledWindow:get_vadjustment()
           local new_val = vadj:get_value() - velocity
@@ -637,6 +814,7 @@ function view_bookmarks()
   end
 
   function treeView:on_motion_notify_event(event)
+    if dialog_destroyed then return false end
     if drag_active then
       velocity = event.y_root - last_y
       last_y = event.y_root
@@ -673,7 +851,26 @@ function view_bookmarks()
   end
 
   function ui.btnNew:on_clicked()
-    dialog_new_bookmark()
+    local refs, createdName = dialog_new_bookmark()
+    if (not refs or #refs == 0) and not createdName then return end
+    local newRef = refs and refs[1]
+
+    -- Rebuild the bookmark list so the new entry appears, then select the row
+    -- that references the newly created text element (match by ref identity,
+    -- falling back to the text on the current page).
+    local currentPage = app.getDocumentStructure().currentPage
+    updateTable()
+    local treeSel = treeView:get_selection()
+    for i, b in ipairs(bookmarks) do
+      local matches = (newRef and b.ref == newRef)
+          or (createdName and b.page == currentPage and b.text == createdName)
+      if matches then
+        local path = Gtk.TreePath.new_from_string(tostring(i - 1))
+        treeSel:select_path(path)
+        treeView:scroll_to_cell(path, nil, true, 0.5, 0.5)
+        break
+      end
+    end
   end
 
   function ui.btnDelete:on_clicked()
@@ -692,6 +889,7 @@ function view_bookmarks()
     app.addToSelection({ref})
     app.activateAction("delete")
     app.clearSelection()
+    app.refreshPage()
 
     pcall(function() store:remove(iter) end)
     
@@ -699,32 +897,50 @@ function view_bookmarks()
     save_document_silently()
   end
 
-  function dialog:on_destroy() stop_inertia() end
+  function dialog:on_destroy()
+    dialog_destroyed = true
+    stop_inertia()
+  end
 
-  function ui.btnDone:on_clicked() dialog:destroy() end
+  function ui.btnDone:on_clicked()
+    commit_active_edit()
+    dialog:destroy()
+  end
 
   local mx, my = get_mouse_position()
   dialog:show_all()
-  if mx and my then dialog:move(mx - dialog:get_allocated_width() / 2, my - dialog:get_allocated_height() / 2) end
+  if mx and my then
+    dialog:move(math.floor(mx - dialog:get_allocated_width() / 2), math.floor(my - dialog:get_allocated_height() / 2))
+  end
 
   if initial_best_idx then
-    local path = lgi.Gtk.TreePath.new_from_string(tostring(initial_best_idx - 1))
-    treeView:get_selection():select_path(path)
-    treeView:scroll_to_cell(path, nil, true, 0.5, 0.0)
+    local okPath, path = pcall(lgi.Gtk.TreePath.new_from_string, tostring(initial_best_idx - 1))
+    if okPath and path then
+      local sel = treeView:get_selection()
+      local okSel = pcall(function()
+        sel:select_path(path)
+        treeView:scroll_to_cell(path, nil, true, 0.5, 0.0)
+      end)
+    end
   end
 end
 
 function export()
-  if not os.execute("pdftk") then return app.openDialog("pdftk is missing.", {"OK"}, "") end
+  local sep = package.config:sub(1,1)
+  local pdftkOk = pcall(os.execute, "pdftk --version")
+  if sep == "\\" then
+    -- On Windows, pdftk is generally not available and the command-line based
+    -- PDF bookmark injection is not supported.
+    return app.openDialog("Export with bookmarks currently requires the `pdftk` tool, which was not found.", {"OK"}, "", true)
+  end
+  if not pdftkOk then return app.openDialog("pdftk is missing.", {"OK"}, "") end
 
   local structure = app.getDocumentStructure()
   local defaultName = (structure.xoppFilename and structure.xoppFilename:match("(.+)%..+$") or DEFAULT_EXPORT_PATH) .. "_export.pdf"
   local path = app.saveAs(defaultName)
   if not path then return end
 
-  local sep = package.config:sub(1,1)
   local tempData = os.tmpname()
-  if sep == "\\" then tempData = tempData:sub(2) end
   local tempPdf = tempData .. "_1337__.pdf"
 
   app.export({outputFile = tempPdf})
